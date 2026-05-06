@@ -1,2 +1,6 @@
 .env
 firebase-key.json
+.streamlit/secrets.toml
+seed_fake_sessions.py
+__pycache__/
+venv/

@@ -1,8 +1,7 @@
 import os
+import threading
 import uuid # [NEW] For generating Session IDs
 import streamlit as st
-import firebase_admin # [NEW] Firebase integration
-from firebase_admin import credentials, firestore # [NEW] Firebase integration
 from dotenv import load_dotenv
 from langchain.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
@@ -13,26 +12,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, AIMessage
 
+from analytics import update_session_metadata
+from firebase_client import init_firebase
+
 load_dotenv()
 
 st.set_page_config(page_title="AI Ombuds Assistant", page_icon="⚖️")
-
-# --- 1. FIREBASE INITIALIZATION ---
-@st.cache_resource(show_spinner="Connecting to Database...")
-@st.cache_resource(show_spinner="Connecting to Database...")
-def init_firebase():
-    if not firebase_admin._apps:
-        # Check if we are running on Streamlit Cloud (using secrets)
-        if "firebase" in st.secrets:
-            # Convert Streamlit's AttrDict to a standard Python dictionary
-            cred_dict = dict(st.secrets["firebase"])
-            cred = credentials.Certificate(cred_dict)
-        else:
-            # Fallback for local development
-            cred = credentials.Certificate("firebase-key.json")
-            
-        firebase_admin.initialize_app(cred)
-    return firestore.client()
 
 db = init_firebase()
 
@@ -132,7 +117,7 @@ def load_chat_from_firestore(session_id):
 
 @st.cache_resource(show_spinner="Initializing AI and Loading Policies...")
 def setup_ombud_system():    
-    model = init_chat_model("gpt-4-turbo") # Adjusted to a standard model name for execution
+    model = init_chat_model("gpt-4o-mini")  # cheap default; bump to "gpt-4o" if empathy quality suffers
     embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
     vector_store = InMemoryVectorStore(embeddings)
 
@@ -314,17 +299,32 @@ if query := st.chat_input("How can I support you today?"):
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
-        
+        tool_calls_seen = []
+
         with st.spinner("Thinking..."):
             try:
                 for event in agent.stream({"messages": messages_for_agent}, stream_mode="values"):
                     last_message = event["messages"][-1]
-                    if isinstance(last_message, AIMessage) and last_message.content:
+                    if last_message.__class__.__name__ == "ToolMessage":
+                        entry = {"tool": getattr(last_message, "name", None), "sources": []}
+                        artifact = getattr(last_message, "artifact", None)
+                        if entry["tool"] == "retrieve_context" and artifact:
+                            entry["sources"] = sorted({
+                                d.metadata.get("source", "Unknown") for d in artifact
+                            })
+                        tool_calls_seen.append(entry)
+                    elif isinstance(last_message, AIMessage) and last_message.content:
                         full_response = last_message.content
                         message_placeholder.markdown(full_response)
             except Exception as e:
                 st.error(f"An error occurred: {e}")
-                
+
         if full_response:
             st.session_state.messages.append(AIMessage(content=full_response))
             save_chat_to_firestore(session_id, st.session_state.messages) # [NEW]
+
+            threading.Thread(
+                target=update_session_metadata,
+                args=(db, session_id, tool_calls_seen),
+                daemon=True,
+            ).start()
